@@ -311,6 +311,22 @@ mod tests {
         v.into_iter()
     }
 
+    // ── run0_bin ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn run0_bin_default_is_run0() {
+        temp_env::with_var_unset("RUN0_BIN", || {
+            assert_eq!(run0_bin(), OsString::from("run0"));
+        });
+    }
+
+    #[test]
+    fn run0_bin_reads_env_override() {
+        temp_env::with_var("RUN0_BIN", Some("/usr/local/bin/run0"), || {
+            assert_eq!(run0_bin(), OsString::from("/usr/local/bin/run0"));
+        });
+    }
+
     // ── parse_args_from ───────────────────────────────────────────────────────
 
     #[test]
@@ -339,6 +355,22 @@ mod tests {
         assert_eq!(opts.user.as_deref(), Some(OsStr::new("bob")));
     }
 
+    /// Only the first '=' is the separator; '=' characters in the value must
+    /// survive verbatim.
+    #[test]
+    fn parse_user_equals_form_with_embedded_equals() {
+        let opts = parse_args_from(args(&["--user=a=b"]));
+        assert_eq!(opts.user.as_deref(), Some(OsStr::new("a=b")));
+    }
+
+    /// When --user appears more than once the last occurrence wins (matches
+    /// typical POSIX option-parsing convention).
+    #[test]
+    fn parse_user_last_occurrence_wins() {
+        let opts = parse_args_from(args(&["--user", "alice", "--user", "bob"]));
+        assert_eq!(opts.user.as_deref(), Some(OsStr::new("bob")));
+    }
+
     #[test]
     fn parse_command_after_options() {
         let opts = parse_args_from(args(&["--user", "alice", "ls", "-la", "/tmp"]));
@@ -354,8 +386,6 @@ mod tests {
 
     #[test]
     fn parse_command_stops_at_first_non_flag() {
-        // "--keep-cwd" appearing after the program name is part of the command,
-        // not a flag for pkexec.
         let opts = parse_args_from(args(&["ls", "--keep-cwd"]));
         assert!(!opts.keep_cwd);
         assert_eq!(
@@ -396,6 +426,11 @@ mod tests {
     }
 
     #[test]
+    fn uid_spec_hash_zero() {
+        assert_eq!(parse_uid_spec(&OsString::from("#0")), Some(0));
+    }
+
+    #[test]
     fn uid_spec_name_returns_none() {
         assert_eq!(parse_uid_spec(&OsString::from("root")), None);
         assert_eq!(parse_uid_spec(&OsString::from("alice")), None);
@@ -403,8 +438,21 @@ mod tests {
 
     #[test]
     fn uid_spec_negative_returns_none() {
-        // "-1" is not a valid u32
         assert_eq!(parse_uid_spec(&OsString::from("-1")), None);
+    }
+
+    /// Values that exceed u32::MAX must not wrap around silently.
+    #[test]
+    fn uid_spec_u32_overflow_returns_none() {
+        assert_eq!(parse_uid_spec(&OsString::from("4294967296")), None);
+    }
+
+    /// Non-UTF-8 byte sequences cannot be parsed as a number.
+    #[test]
+    fn uid_spec_non_utf8_returns_none() {
+        use std::os::unix::ffi::OsStringExt;
+        let bad = OsString::from_vec(vec![0xFF, 0xFE]);
+        assert_eq!(parse_uid_spec(&bad), None);
     }
 
     // ── user_is_root ──────────────────────────────────────────────────────────
@@ -436,8 +484,8 @@ mod tests {
 
     // ── build_run0_argv ───────────────────────────────────────────────────────
 
-    /// Collect the run0 argv produced for given opts, without the
-    /// `--chdir` entry (its value depends on the test host's /etc/passwd).
+    /// Strip `--chdir <VALUE>` pairs from a run0 argv; the chdir value depends
+    /// on the host /etc/passwd, making it unsuitable for exact-match assertions.
     fn argv_without_chdir(opts: &Opts) -> Vec<OsString> {
         let v = build_run0_argv(opts);
         let mut out = Vec::new();
@@ -497,6 +545,23 @@ mod tests {
         );
     }
 
+    /// --chdir must be absent when home lookup fails and keep_cwd is false.
+    /// This exercises the silent-fallback behaviour (no panic, no --chdir "").
+    #[test]
+    fn argv_no_chdir_when_home_lookup_fails() {
+        // UID 4294967294 virtually never exists on any real system.
+        let opts = Opts {
+            keep_cwd: false,
+            user: Some(OsString::from("4294967294")),
+            command: vec![],
+        };
+        let v = build_run0_argv(&opts);
+        assert!(
+            !v.contains(&OsString::from("--chdir")),
+            "expected no --chdir for nonexistent user, got: {v:?}"
+        );
+    }
+
     #[test]
     fn argv_always_sets_pkexec_uid() {
         let opts = Opts {
@@ -505,13 +570,81 @@ mod tests {
             command: vec![],
         };
         let v = build_run0_argv(&opts);
-        let setenv_pos = v.iter().position(|a| a == "--setenv");
-        assert!(setenv_pos.is_some(), "--setenv must be present");
-        let val = &v[setenv_pos.unwrap() + 1];
+        let pos = v.iter().position(|a| a == "--setenv");
+        assert!(pos.is_some(), "--setenv must be present");
+        let val = &v[pos.unwrap() + 1];
         assert!(
             val.to_string_lossy().starts_with("PKEXEC_UID="),
             "expected PKEXEC_UID=…, got {val:?}"
         );
+    }
+
+    /// The PKEXEC_UID value must equal the real UID of the calling process.
+    #[test]
+    fn argv_pkexec_uid_matches_current_uid() {
+        let opts = Opts {
+            keep_cwd: true,
+            user: None,
+            command: vec![],
+        };
+        let v = build_run0_argv(&opts);
+        let pos = v.iter().position(|a| a == "--setenv").unwrap();
+        let got = v[pos + 1].to_str().unwrap();
+        let expected = format!("PKEXEC_UID={}", current_uid());
+        assert_eq!(got, expected);
+    }
+
+    /// Numeric-UID user strings must be forwarded verbatim to run0.
+    #[test]
+    fn argv_numeric_uid_user_forwarded_verbatim() {
+        let opts = Opts {
+            keep_cwd: true,
+            user: Some(OsString::from("1000")),
+            command: vec![OsString::from("id")],
+        };
+        let v = build_run0_argv(&opts);
+        assert_eq!(v[0], "--user");
+        assert_eq!(v[1], "1000");
+    }
+
+    /// #UID-prefixed user strings must also be forwarded verbatim.
+    #[test]
+    fn argv_hash_uid_user_forwarded_verbatim() {
+        let opts = Opts {
+            keep_cwd: true,
+            user: Some(OsString::from("#0")),
+            command: vec![OsString::from("whoami")],
+        };
+        let v = build_run0_argv(&opts);
+        assert_eq!(v[1], "#0");
+    }
+
+    /// --via-shell must be absent whenever a command is provided.
+    #[test]
+    fn argv_no_via_shell_when_command_present() {
+        let opts = Opts {
+            keep_cwd: true,
+            user: None,
+            command: vec![OsString::from("ls")],
+        };
+        let v = build_run0_argv(&opts);
+        assert!(!v.contains(&OsString::from("--via-shell")));
+    }
+
+    /// --user must precede --setenv which must precede the command.
+    #[test]
+    fn argv_stable_argument_order() {
+        let opts = Opts {
+            keep_cwd: true,
+            user: Some(OsString::from("root")),
+            command: vec![OsString::from("id")],
+        };
+        let v = build_run0_argv(&opts);
+        let user_pos = v.iter().position(|a| a == "--user").unwrap();
+        let setenv_pos = v.iter().position(|a| a == "--setenv").unwrap();
+        let cmd_pos = v.iter().position(|a| a == "id").unwrap();
+        assert!(user_pos < setenv_pos, "--user must precede --setenv");
+        assert!(setenv_pos < cmd_pos, "--setenv must precede the command");
     }
 
     #[test]
@@ -526,44 +659,93 @@ mod tests {
             ],
         };
         let v = build_run0_argv(&opts);
-        let bash_pos = v.iter().position(|a| a == "bash").expect("bash not found");
-        assert_eq!(v[bash_pos + 1], "-c");
-        assert_eq!(v[bash_pos + 2], "echo hello");
+        let pos = v.iter().position(|a| a == "bash").expect("bash not found");
+        assert_eq!(v[pos + 1], "-c");
+        assert_eq!(v[pos + 2], "echo hello");
+    }
+
+    // ── lookup_target_home ────────────────────────────────────────────────────
+
+    #[test]
+    fn lookup_target_home_by_name_root() {
+        assert!(lookup_target_home(&OsString::from("root")).is_some());
+    }
+
+    #[test]
+    fn lookup_target_home_by_numeric_uid_zero() {
+        assert!(lookup_target_home(&OsString::from("0")).is_some());
+    }
+
+    #[test]
+    fn lookup_target_home_by_hash_uid_zero() {
+        assert!(lookup_target_home(&OsString::from("#0")).is_some());
+    }
+
+    /// All three spellings of root (name / plain UID / #UID) must resolve to
+    /// the same home directory.
+    #[test]
+    fn lookup_target_home_all_root_spellings_agree() {
+        let by_name = lookup_target_home(&OsString::from("root"));
+        let by_uid = lookup_target_home(&OsString::from("0"));
+        let by_hash_uid = lookup_target_home(&OsString::from("#0"));
+        assert_eq!(by_name, by_uid);
+        assert_eq!(by_uid, by_hash_uid);
+    }
+
+    #[test]
+    fn lookup_target_home_nonexistent_returns_none() {
+        let home = lookup_target_home(&OsString::from("thisuserdoesnotexist_run0shimtest_xyzzy"));
+        assert!(home.is_none());
     }
 
     // ── passwd lookups (live, best-effort) ────────────────────────────────────
 
     #[test]
     fn lookup_root_home_by_name() {
-        // root always exists on Unix; home is typically /root but may differ.
         let home = lookup_home_by_name(OsStr::new("root"));
         assert!(home.is_some(), "lookup of 'root' by name should succeed");
-        let home = home.unwrap();
-        assert!(!home.is_empty(), "root home should not be empty");
+        assert!(!home.unwrap().is_empty(), "root home should not be empty");
     }
 
     #[test]
     fn lookup_root_home_by_uid() {
         let home = lookup_home_by_uid(0);
         assert!(home.is_some(), "lookup of uid 0 should succeed");
+        assert!(!home.unwrap().is_empty(), "uid-0 home should not be empty");
     }
 
     #[test]
     fn lookup_name_and_uid_agree_for_root() {
-        let by_name = lookup_home_by_name(OsStr::new("root"));
-        let by_uid = lookup_home_by_uid(0);
-        assert_eq!(by_name, by_uid);
+        assert_eq!(
+            lookup_home_by_name(OsStr::new("root")),
+            lookup_home_by_uid(0),
+        );
     }
 
     #[test]
     fn lookup_nonexistent_user_returns_none() {
-        let home = lookup_home_by_name(OsStr::new("thisuserdoesnotexist_run0shimtest_xyzzy"));
-        assert!(home.is_none());
+        assert!(
+            lookup_home_by_name(OsStr::new("thisuserdoesnotexist_run0shimtest_xyzzy")).is_none()
+        );
     }
 
     #[test]
     fn lookup_very_high_uid_returns_none() {
-        // UID u32::MAX is virtually guaranteed not to exist.
         assert!(lookup_home_by_uid(u32::MAX).is_none());
+    }
+
+    #[test]
+    fn parse_double_dash_stops_option_parsing() {
+        let opts = parse_args_from(args(&["--keep-cwd", "--", "echo", "--keep-cwd"]));
+        assert!(opts.keep_cwd);
+        assert_eq!(
+            opts.command,
+            vec![OsString::from("echo"), OsString::from("--keep-cwd")]
+        );
+    }
+
+    #[test]
+    fn uid_spec_hash_only_returns_none() {
+        assert_eq!(parse_uid_spec(&OsString::from("#")), None);
     }
 }
