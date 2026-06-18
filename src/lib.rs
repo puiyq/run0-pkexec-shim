@@ -140,9 +140,10 @@ where
                 print_help();
                 exit(0);
             }
-
-            // Accepted for compatibility with real pkexec; has no effect here
-            // because we do not spawn a polkit authentication agent.
+            Some("--") => {
+                command.extend(argv);
+                break;
+            }
             Some("--disable-internal-agent") => {}
             Some("--keep-cwd") => keep_cwd = true,
             Some("--user") => {
@@ -153,7 +154,7 @@ where
                 user = Some(v);
             }
             Some(s) if s.starts_with("--user=") => {
-                user = Some(OsString::from(&s["--user=".len()..]));
+                user = Some(OsString::from(s.strip_prefix("--user=").unwrap()));
             }
             _ => {
                 command.push(arg);
@@ -182,7 +183,13 @@ where
 #[must_use]
 pub fn parse_uid_spec(user: &OsString) -> Option<u32> {
     let s = user.to_str()?;
-    let s = s.strip_prefix('#').unwrap_or(s);
+
+    let s = match s.strip_prefix('#') {
+        Some("") => return None,
+        Some(rest) => rest,
+        None => s,
+    };
+
     s.parse().ok()
 }
 
