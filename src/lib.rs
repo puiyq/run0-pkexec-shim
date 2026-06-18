@@ -20,12 +20,10 @@
 
 use std::{
     env,
-    ffi::{CStr, CString, OsStr, OsString},
-    mem::MaybeUninit,
-    os::unix::ffi::{OsStrExt, OsStringExt},
+    ffi::{OsStr, OsString},
     process::exit,
-    ptr,
 };
+use uzers::os::unix::UserExt;
 
 /// The crate version, taken from `Cargo.toml` at compile time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -57,14 +55,15 @@ pub struct Opts {
 /// Returns the path (or name) of the `run0` binary to invoke.
 ///
 /// Reads `$RUN0_BIN`; falls back to `"run0"` (i.e. PATH lookup).
+#[must_use]
 pub fn run0_bin() -> OsString {
     env::var_os("RUN0_BIN").unwrap_or_else(|| OsString::from("run0"))
 }
 
-/// Returns the effective UID of the calling process via `getuid(2)`.
-pub fn current_uid() -> libc::uid_t {
-    // SAFETY: getuid is always safe to call.
-    unsafe { libc::getuid() }
+/// Returns the real UID of the calling process.
+#[must_use]
+pub fn current_uid() -> u32 {
+    uzers::get_current_uid()
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -125,7 +124,7 @@ where
     I: IntoIterator<Item = OsString>,
 {
     let mut argv = argv.into_iter();
-    let _ = argv.next(); // skip argv[0]
+    let _ = argv.next();
 
     let mut keep_cwd = false;
     let mut user = None;
@@ -137,7 +136,6 @@ where
                 println!("run0-pkexec-shim {VERSION}");
                 exit(0);
             }
-
             Some("--help") => {
                 print_help();
                 exit(0);
@@ -146,9 +144,7 @@ where
             // Accepted for compatibility with real pkexec; has no effect here
             // because we do not spawn a polkit authentication agent.
             Some("--disable-internal-agent") => {}
-
             Some("--keep-cwd") => keep_cwd = true,
-
             Some("--user") => {
                 let v = argv.next().unwrap_or_else(|| {
                     eprintln!("pkexec: missing --user argument");
@@ -156,14 +152,9 @@ where
                 });
                 user = Some(v);
             }
-
-            // Support both `--user alice` and `--user=alice`.
             Some(s) if s.starts_with("--user=") => {
                 user = Some(OsString::from(&s["--user=".len()..]));
             }
-
-            // First unrecognised argument — treat it and everything after it
-            // as the PROGRAM + ARGUMENTS to execute.
             _ => {
                 command.push(arg);
                 command.extend(argv);
@@ -188,6 +179,7 @@ where
 /// Accepts plain decimals (`"0"`, `"1000"`) and the `#UID` prefix form
 /// (`"#0"`, `"#1000"`).  Returns `None` for non-numeric strings such as
 /// `"root"` or `"alice"`.
+#[must_use]
 pub fn parse_uid_spec(user: &OsString) -> Option<u32> {
     let s = user.to_str()?;
     let s = s.strip_prefix('#').unwrap_or(s);
@@ -196,6 +188,7 @@ pub fn parse_uid_spec(user: &OsString) -> Option<u32> {
 
 /// Returns `true` if `user` refers to the root account (UID 0 or the name
 /// `"root"`).
+#[must_use]
 pub fn user_is_root(user: &OsString) -> bool {
     match parse_uid_spec(user) {
         Some(uid) => uid == 0,
@@ -204,111 +197,37 @@ pub fn user_is_root(user: &OsString) -> bool {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// passwd lookups
+// ── User lookups
 // ────────────────────────────────────────────────────────────────────────────
 
-/// Extracts the home directory (`pw_dir`) from a `passwd` entry.
+/// Looks up the home directory for the given user **name**.
 ///
-/// Returns `None` if the `pw_dir` pointer is null or empty.
-fn home_from_passwd(pwd: &libc::passwd) -> Option<OsString> {
-    if pwd.pw_dir.is_null() {
-        return None;
-    }
-    // SAFETY: pw_dir is non-null and points to a C string owned by the
-    // buffer we passed to getpwnam_r / getpwuid_r.  The buffer outlives
-    // this call because it is borrowed by the caller via `pwd`.
-    unsafe {
-        Some(OsString::from_vec(
-            CStr::from_ptr(pwd.pw_dir).to_bytes().to_vec(),
-        ))
-    }
-}
-
-/// Looks up the home directory for the given user **name** via `getpwnam_r(3)`.
-///
-/// Returns `None` if the user does not exist or the lookup fails.
+/// Returns `None` if the user does not exist, the name is not valid UTF-8,
+/// or the home directory path is empty.
+#[must_use]
 pub fn lookup_home_by_name(name: &OsStr) -> Option<OsString> {
-    // CString::new fails only if `name` contains an interior NUL byte, which
-    // is not a valid Unix username.
-    let c = CString::new(name.as_bytes()).ok()?;
-    let mut buf_len = 1024usize;
-
-    loop {
-        let mut pwd = MaybeUninit::<libc::passwd>::zeroed();
-        let mut result: *mut libc::passwd = ptr::null_mut();
-        let mut buf = vec![0u8; buf_len];
-
-        // SAFETY: all pointers are valid for the lifetime of this block.
-        let ret = unsafe {
-            libc::getpwnam_r(
-                c.as_ptr(),
-                pwd.as_mut_ptr(),
-                buf.as_mut_ptr() as *mut libc::c_char,
-                buf.len(),
-                &mut result,
-            )
-        };
-
-        match ret {
-            // Success: result == null means "user not found".
-            0 => {
-                if result.is_null() {
-                    return None;
-                }
-                // SAFETY: ret == 0 and result is non-null, so pwd is initialised.
-                let pwd = unsafe { pwd.assume_init() };
-                return home_from_passwd(&pwd);
-            }
-            // Buffer too small — double it and retry.
-            libc::ERANGE => buf_len = buf_len.saturating_mul(2),
-            // Any other errno means a hard failure.
-            _ => return None,
-        }
-    }
+    let home = uzers::get_user_by_name(name.to_str()?)?
+        .home_dir()
+        .as_os_str()
+        .to_os_string();
+    if home.is_empty() { None } else { Some(home) }
 }
 
-/// Looks up the home directory for the given **UID** via `getpwuid_r(3)`.
+/// Looks up the home directory for the given **UID**.
 ///
-/// Returns `None` if the UID does not exist or the lookup fails.
+/// Returns `None` if the UID does not exist or the home directory path is empty.
+#[must_use]
 pub fn lookup_home_by_uid(uid: u32) -> Option<OsString> {
-    let mut buf_len = 1024usize;
-
-    loop {
-        let mut pwd = MaybeUninit::<libc::passwd>::zeroed();
-        let mut result: *mut libc::passwd = ptr::null_mut();
-        let mut buf = vec![0u8; buf_len];
-
-        // SAFETY: all pointers are valid for the lifetime of this block.
-        let ret = unsafe {
-            libc::getpwuid_r(
-                uid as libc::uid_t,
-                pwd.as_mut_ptr(),
-                buf.as_mut_ptr() as *mut libc::c_char,
-                buf.len(),
-                &mut result,
-            )
-        };
-
-        match ret {
-            0 => {
-                if result.is_null() {
-                    return None;
-                }
-                // SAFETY: ret == 0 and result is non-null, so pwd is initialised.
-                let pwd = unsafe { pwd.assume_init() };
-                return home_from_passwd(&pwd);
-            }
-            libc::ERANGE => buf_len = buf_len.saturating_mul(2),
-            _ => return None,
-        }
-    }
+    let home = uzers::get_user_by_uid(uid)?
+        .home_dir()
+        .as_os_str()
+        .to_os_string();
+    if home.is_empty() { None } else { Some(home) }
 }
 
 /// Resolves the home directory for `user`, which may be a name, a plain UID,
 /// or a `#UID`-prefixed string.
-///
-/// Delegates to [`lookup_home_by_uid`] or [`lookup_home_by_name`] as
-/// appropriate.
+#[must_use]
 pub fn lookup_target_home(user: &OsString) -> Option<OsString> {
     if let Some(uid) = parse_uid_spec(user) {
         return lookup_home_by_uid(uid);
@@ -334,6 +253,7 @@ pub fn lookup_target_home(user: &OsString) -> Option<OsString> {
 ///   programs that read this variable.
 /// * Passes `--via-shell` when no PROGRAM was given; otherwise appends the
 ///   PROGRAM and its ARGUMENTS verbatim.
+#[must_use]
 pub fn build_run0_argv(opts: &Opts) -> Vec<OsString> {
     let target_user = opts
         .user
@@ -378,8 +298,6 @@ mod tests {
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
-    /// Turn a slice of `&str` into the iterator shape `parse_args_from` expects,
-    /// including a fake argv[0].
     fn args(argv: &[&str]) -> impl Iterator<Item = OsString> {
         let mut v: Vec<OsString> = vec![OsString::from("pkexec")];
         v.extend(argv.iter().map(OsString::from));
