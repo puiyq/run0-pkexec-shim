@@ -33,6 +33,8 @@
             inputsFrom = [ self'.packages.default ];
             packages = with pkgs; [
               rust-analyzer
+              clippy
+              rustfmt
             ];
           };
           treefmt = {
