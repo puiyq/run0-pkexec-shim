@@ -1,35 +1,27 @@
 //! Entry point for the `pkexec` shim binary.
 //!
-//! Parses arguments, builds the `run0` command line, spawns it, and
-//! forwards its exit code verbatim.  No exit-code translation is done
-//! here: `run0` already returns 126/127 for authentication failures,
-//! matching the semantics documented in `pkexec(1)`.
-
+//! Parses arguments, builds the `run0` command line, then **exec**s into it,
+//! replacing the current process image.  This means:
+//!
+//! - Signals sent to the shim PID are delivered directly to run0.
+//! - No extra process appears in the process tree.
+//! - The exit code is run0's own exit code, without any mapping layer.
+use run0_pkexec_shim::*;
+use std::os::unix::process::CommandExt; // exec()
 use std::process::{Command, exit};
 
-use run0_pkexec_shim::*;
+pub fn build_run0_command(opts: &Opts) -> Command {
+    let argv = build_run0_argv(opts);
+    let mut cmd = Command::new(run0_bin());
+    cmd.args(&argv);
+    cmd
+}
 
 fn main() {
     let opts = parse_args();
-    let argv = build_run0_argv(&opts);
+    let mut cmd = build_run0_command(&opts);
 
-    let mut cmd = Command::new(run0_bin());
-    cmd.args(&argv);
-
-    let status = match cmd.spawn() {
-        Ok(mut child) => child.wait().unwrap_or_else(|e| {
-            eprintln!("pkexec: failed to wait for child: {e}");
-            exit(1);
-        }),
-        Err(e) => {
-            // run0 itself could not be launched — this is a shim
-            // configuration problem, not an authorization failure.
-            eprintln!("pkexec: failed to execute run0: {e}");
-            exit(1);
-        }
-    };
-
-    // Forward run0's exit code directly.  POSIX signals that terminate the
-    // child without an exit code are mapped to 1 as a safe fallback.
-    exit(status.code().unwrap_or(1));
+    let err = cmd.exec();
+    eprintln!("pkexec: failed to execute run0: {err}");
+    exit(1);
 }
