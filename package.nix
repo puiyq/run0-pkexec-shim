@@ -2,10 +2,9 @@
   lib,
   rustPlatform,
 }:
-rustPlatform.buildRustPackage (finalAttrs: {
-  cargo-toml = (lib.importTOML ./Cargo.toml).package;
+rustPlatform.buildRustPackage {
+  inherit ((lib.importTOML ./Cargo.toml).package) name version;
 
-  inherit (finalAttrs.cargo-toml) name version;
   src = lib.fileset.toSource {
     root = ./.;
     fileset = lib.fileset.unions [
@@ -20,9 +19,11 @@ rustPlatform.buildRustPackage (finalAttrs: {
   __structuredAttrs = true;
 
   meta = {
-    inherit (finalAttrs.cargo-toml) description;
-    mainProgram = finalAttrs.cargo-toml.name;
-    license = lib.getLicenseFromSpdxId finalAttrs.cargo-toml.license;
+    mainProgram = "run0-pkexec-shim";
+    description = "Shim for the pkexec command that utilizes run0";
+    homepage = "https://github.com/puiyq/run0-pkexec-shim";
+    license = lib.licenses.mit;
     maintainers = with lib.maintainers; [ puiyq ];
+    platforms = lib.platforms.linux;
   };
-})
+}
