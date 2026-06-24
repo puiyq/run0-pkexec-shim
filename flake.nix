@@ -29,7 +29,7 @@
             default = self'.packages."run0-pkexec-shim";
           };
 
-          devShells.default = pkgs.mkShell.override { stdenv = pkgs.clangStdenv; } {
+          devShells.default = pkgs.mkShell {
             inputsFrom = [ self'.packages.default ];
             packages = with pkgs; [
               rust-analyzer
