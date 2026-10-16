@@ -5,10 +5,6 @@
       url = "github:hercules-ci/flake-parts";
       inputs.nixpkgs-lib.follows = "nixpkgs";
     };
-    treefmt-nix = {
-      url = "github:numtide/treefmt-nix";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
   };
 
   outputs =
@@ -19,7 +15,7 @@
         "aarch64-linux"
       ];
 
-      imports = [ inputs.treefmt-nix.flakeModule ];
+      imports = [ ./dev/partition.nix ];
 
       perSystem =
         { pkgs, self', ... }:
@@ -36,19 +32,6 @@
               clippy
               rustfmt
             ];
-          };
-          treefmt = {
-            projectRootFile = "flake.nix";
-            programs = {
-              deadnix.enable = true;
-              nixfmt = {
-                enable = true;
-                package = pkgs.nixfmt-rs;
-              };
-              rustfmt.enable = true;
-              statix.enable = true;
-              taplo.enable = true;
-            };
           };
         };
 
